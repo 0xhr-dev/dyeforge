@@ -18,6 +18,7 @@ import colorsys
 import logging
 import math
 import os
+import statistics
 import threading
 import time
 import tkinter as tk
@@ -528,6 +529,7 @@ class ColorMatcherApp:
 
         # Auto-adjust settings
         self._skip_click = tk.BooleanVar(value=True)
+        self._eye_mode = tk.BooleanVar(value=False)
         self._threshold = tk.DoubleVar(value=1.0)  # Delta E threshold (lower = stricter)
         self._max_retries = tk.IntVar(value=30)
 
@@ -869,6 +871,13 @@ class ColorMatcherApp:
             font=("Segoe UI", 8)
         ).pack(side="left")
 
+        tk.Checkbutton(
+            settings, text="👁 瞳", variable=self._eye_mode,
+            bg=CARD_BG, fg=TEXT_PRIMARY, selectcolor=CARD_BORDER,
+            activebackground=CARD_BG, activeforeground=TEXT_PRIMARY,
+            font=("Segoe UI", 8)
+        ).pack(side="left", padx=(6, 0))
+
         tk.Spinbox(settings, from_=1, to=20, increment=1, width=3,
                    textvariable=self._max_retries, font=("Segoe UI", 8),
                    bg=CARD_BORDER, fg=TEXT_PRIMARY, buttonbackground=CARD_BORDER
@@ -1053,14 +1062,23 @@ class ColorMatcherApp:
         self._auto_status.configure(text="調整中...", fg=INDIGO_LIGHT)
         threading.Thread(target=self._do_auto_adjust, daemon=True).start()
 
-    def _sample_game_color(self):
+    def _sample_game_color(self, use_eye=False):
         """Capture the game window and read the color at the watch position.
-        Takes 2 samples with a short delay and returns the average for stability."""
+
+        Default: 2 samples × 150ms, returns average (fast, for real-time display).
+        use_eye=True: 6 samples × 150ms, returns per-channel median.
+          Blinks (~0.3s = up to 2 samples) are rejected as outliers.
+          Only enabled when the user has toggled _eye_mode ON.
+        """
         if not self._watch_img_pos or not self.selected_hwnd:
             return None
         ix, iy = self._watch_img_pos
+
+        eye_mode = use_eye and self._eye_mode.get()
+        n_samples = 6 if eye_mode else 2
+
         samples = []
-        for _ in range(2):
+        for _ in range(n_samples):
             img = capture_window_printwindow(self.selected_hwnd)
             if img is None:
                 img = capture_screen_region(self.selected_hwnd)
@@ -1069,9 +1087,16 @@ class ColorMatcherApp:
             time.sleep(0.15)
         if not samples:
             return None
-        r = round(sum(s[0] for s in samples) / len(samples))
-        g = round(sum(s[1] for s in samples) / len(samples))
-        b = round(sum(s[2] for s in samples) / len(samples))
+
+        if eye_mode and len(samples) >= 3:
+            # Median per channel rejects blink outliers
+            r = round(statistics.median(s[0] for s in samples))
+            g = round(statistics.median(s[1] for s in samples))
+            b = round(statistics.median(s[2] for s in samples))
+        else:
+            r = round(sum(s[0] for s in samples) / len(samples))
+            g = round(sum(s[1] for s in samples) / len(samples))
+            b = round(sum(s[2] for s in samples) / len(samples))
         return (r, g, b)
 
     # Game's accepted RGB range
@@ -1166,13 +1191,13 @@ class ColorMatcherApp:
             # === Phase 2: HEX input (clamped, as initial guess) ===
             if has_hex:
                 # Debug: sample before input
-                before = self._sample_game_color() if self._watch_img_pos else None
+                before = self._sample_game_color(use_eye=True) if self._watch_img_pos else None
                 hex_code = self._rgb_to_hex(tr, tg, tb)
                 _status(f"[2] HEX入力: #{hex_code}")
                 type_hex_into_field(hex_pos[0], hex_pos[1], hex_code)
                 time.sleep(0.8)  # wait for game to render
                 # Debug: sample after input
-                after = self._sample_game_color() if self._watch_img_pos else None
+                after = self._sample_game_color(use_eye=True) if self._watch_img_pos else None
                 logging.info(f"  HEX入力テスト: #{hex_code}")
                 logging.info(f"    入力前: {before}")
                 logging.info(f"    入力後: {after}")
@@ -1227,7 +1252,7 @@ class ColorMatcherApp:
                         logging.info("ユーザーによるキャンセル")
                         _status("キャンセル", TEXT_DIM)
                         break
-                    result = self._sample_game_color()
+                    result = self._sample_game_color(use_eye=True)
                     if result is None:
                         logging.info(f"{attempt+1:3} | {'':>8} | {'キャプチャ失敗':>15} |")
                         _status(f"[補正{attempt+1}] キャプチャ失敗", "#ef4444")
@@ -1365,7 +1390,7 @@ class ColorMatcherApp:
                     time.sleep(0.8)
 
                 # Final check
-                final = self._sample_game_color()
+                final = self._sample_game_color(use_eye=True)
                 use = final if final else best_result
                 if use:
                     score = similarity_score(self.target_color, use)
