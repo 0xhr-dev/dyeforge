@@ -528,7 +528,7 @@ class ColorMatcherApp:
 
         # Auto-adjust settings
         self._skip_click = tk.BooleanVar(value=True)
-        self._threshold = tk.DoubleVar(value=2.0)  # Delta E threshold (lower = stricter)
+        self._threshold = tk.DoubleVar(value=1.0)  # Delta E threshold (lower = stricter)
         self._max_retries = tk.IntVar(value=30)
 
         self._load_calibration()
@@ -707,8 +707,15 @@ class ColorMatcherApp:
             int(c * 255) for c in colorsys.hsv_to_rgb(h_deg / 360, 1, 1)
         ]
 
-        # Game-reachable zone: S <= GAME_S_MAX (78%)
+        # Game-reachable zone boundaries
         s_max_frac = ColorMatcherApp.GAME_S_MAX_PCT / 100
+        v_min_frac = ColorMatcherApp.GAME_V_MIN_PCT / 100
+        v_max_frac = ColorMatcherApp.GAME_V_MAX_PCT / 100
+
+        # Semi-transparent filter blend: keeps original color visible
+        # unreachable = original * 0.55 + dark_red_tint * 0.45
+        TINT = (30, 10, 10)  # dark reddish tint
+        TINT_ALPHA = 0.45
 
         if HAS_NUMPY:
             xs = np.linspace(0, 1, sq).reshape(1, sq)
@@ -717,9 +724,16 @@ class ColorMatcherApp:
             g_ch = ((1 - xs) + xs * base_g / 255) * ys * 255
             b_ch = ((1 - xs) + xs * base_b / 255) * ys * 255
             arr = np.stack([r_ch, g_ch, b_ch], axis=-1).clip(0, 255).astype(np.uint8)
-            # Darken unreachable zone (S > s_max)
-            unreachable_mask = xs > s_max_frac
-            arr[unreachable_mask[0]] = (arr[unreachable_mask[0]] * 0.35).astype(np.uint8)
+
+            s_mask = xs > s_max_frac
+            v_low_mask = ys < v_min_frac
+            v_high_mask = ys > v_max_frac
+            unreachable_2d = s_mask | v_low_mask | v_high_mask
+            unreachable_3d = np.broadcast_to(unreachable_2d[..., None], arr.shape)
+            # Blend: arr*0.55 + tint*0.45
+            tint_arr = np.array(TINT, dtype=np.float32)
+            blended = (arr.astype(np.float32) * (1 - TINT_ALPHA) + tint_arr * TINT_ALPHA)
+            arr = np.where(unreachable_3d, blended.astype(np.uint8), arr)
             sv_img = Image.fromarray(arr, "RGB")
         else:
             sv_img = Image.new("RGB", (sq, sq))
@@ -730,17 +744,33 @@ class ColorMatcherApp:
                     r = int(((1 - s) + s * base_r / 255) * v * 255)
                     g = int(((1 - s) + s * base_g / 255) * v * 255)
                     b = int(((1 - s) + s * base_b / 255) * v * 255)
-                    if s > s_max_frac:
-                        r, g, b = int(r * 0.35), int(g * 0.35), int(b * 0.35)
+                    if s > s_max_frac or v < v_min_frac or v > v_max_frac:
+                        r = int(r * (1 - TINT_ALPHA) + TINT[0] * TINT_ALPHA)
+                        g = int(g * (1 - TINT_ALPHA) + TINT[1] * TINT_ALPHA)
+                        b = int(b * (1 - TINT_ALPHA) + TINT[2] * TINT_ALPHA)
                     sv_img.putpixel((px, py), (r, g, b))
 
         self._sv_photo = ImageTk.PhotoImage(sv_img)
         canvas.create_image(start_x, y0, anchor="nw", image=self._sv_photo)
 
-        # Draw boundary line between reachable and unreachable zones
+        # Boundary lines (red dashed)
+        # Vertical: S limit
         boundary_x = start_x + s_max_frac * sq
         canvas.create_line(boundary_x, y0, boundary_x, y0 + sq,
-                           fill="#666666", dash=(2, 2), width=1)
+                           fill="#ef4444", dash=(3, 2), width=2)
+        # Horizontal: V min (bottom)
+        v_min_y = y0 + (1 - v_min_frac) * sq
+        canvas.create_line(start_x, v_min_y, start_x + sq, v_min_y,
+                           fill="#ef4444", dash=(3, 2), width=2)
+        # Horizontal: V max (top)
+        v_max_y = y0 + (1 - v_max_frac) * sq
+        canvas.create_line(start_x, v_max_y, start_x + sq, v_max_y,
+                           fill="#ef4444", dash=(3, 2), width=2)
+
+        # "範囲外" label in the unreachable corner
+        canvas.create_text(start_x + sq - 10, y0 + 10,
+                           text="範囲外", fill="#ef4444",
+                           font=("Segoe UI", 7, "bold"), anchor="ne")
 
         # Target marker (white circle with dot)
         tx = start_x + t_hsv["s"] / 100 * sq
@@ -888,6 +918,16 @@ class ColorMatcherApp:
     # ── Calibration (1 click: HEX input field) ───────────────────
 
     def _start_calibration(self):
+        # Auto-focus BPSR game window before showing overlay
+        game_hwnd = self.selected_hwnd if (self.selected_hwnd and user32.IsWindow(self.selected_hwnd)) else find_game_window()
+        if game_hwnd:
+            self.selected_hwnd = game_hwnd
+            # Restore if minimized
+            if user32.IsIconic(game_hwnd):
+                user32.ShowWindow(game_hwnd, SW_RESTORE)
+            user32.SetForegroundWindow(game_hwnd)
+            time.sleep(0.3)
+
         self.root.withdraw()
         self.root.update()
         time.sleep(0.2)
@@ -1039,6 +1079,10 @@ class ColorMatcherApp:
     GAME_RGB_MAX = 0xDA  # 218
     # Game's HSV saturation ceiling (flat across H/V, determined by test4)
     GAME_S_MAX_PCT = 78.0
+    # Game's effective output V range (due to gamma transform)
+    # Input 0x1A → output ~23%, Input 0xDA → output ~91%
+    GAME_V_MIN_PCT = 23.0
+    GAME_V_MAX_PCT = 91.0
     # HSV saturation limit: S_max = 0.25 * V + 55 (with safety margin)
     # From testing:
     #   V=85.5% → S_max≈79%, V=62.7% → S_max≈71%, V=50.2% → S_max≈70%
