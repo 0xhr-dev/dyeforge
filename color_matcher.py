@@ -19,6 +19,7 @@ import logging
 import math
 import os
 import statistics
+import sys
 import threading
 import time
 import tkinter as tk
@@ -38,6 +39,27 @@ try:
     HAS_NUMPY = True
 except ImportError:
     HAS_NUMPY = False
+
+
+def _resource_path(rel):
+    """Locate a bundled/adjacent data file.
+
+    Resolution order:
+      1. PyInstaller --onefile extract dir (sys._MEIPASS) if frozen
+      2. Directory of the exe (for files dropped next to DyeForge.exe)
+      3. Directory of this .py (dev environment)
+    Returns the first existing path, or None if none found.
+    """
+    candidates = []
+    if getattr(sys, "frozen", False):
+        if hasattr(sys, "_MEIPASS"):
+            candidates.append(os.path.join(sys._MEIPASS, rel))
+        candidates.append(os.path.join(os.path.dirname(sys.executable), rel))
+    candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), rel))
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return None
 
 # ── Win32 API helpers ──────────────────────────────────────────────
 
@@ -419,6 +441,39 @@ def rgb_to_lab(r, g, b):
     return (L, a, b_lab)
 
 
+def lab_to_rgb_approx(lab):
+    """CIE Lab (D65) → sRGB (0-255 int). Approximate inverse of rgb_to_lab.
+    Used by the LUT refinement loop to convert Lab-space residuals back
+    to RGB targets for find_best_input.
+    """
+    L, a, b_lab = lab
+    fy = (L + 16) / 116
+    fx = a / 500 + fy
+    fz = fy - b_lab / 200
+
+    def finv(t):
+        delta = 6 / 29
+        if t > delta:
+            return t ** 3
+        return 3 * delta * delta * (t - 4 / 29)
+
+    xn, yn, zn = finv(fx) * 0.95047, finv(fy) * 1.00000, finv(fz) * 1.08883
+    rl = 3.2404542 * xn - 1.5371385 * yn - 0.4985314 * zn
+    gl = -0.9692660 * xn + 1.8760108 * yn + 0.0415560 * zn
+    bl = 0.0556434 * xn - 0.2040259 * yn + 1.0572252 * zn
+
+    def gamma_encode(c):
+        c = max(0.0, c)
+        if c <= 0.0031308:
+            return 12.92 * c
+        return 1.055 * (c ** (1 / 2.4)) - 0.055
+
+    R = max(0, min(255, round(gamma_encode(rl) * 255)))
+    G = max(0, min(255, round(gamma_encode(gl) * 255)))
+    B = max(0, min(255, round(gamma_encode(bl) * 255)))
+    return (R, G, B)
+
+
 def delta_e(rgb1, rgb2):
     """CIE76 Delta E — perceptual color distance.
     < 1: indistinguishable, < 2: trained eye only, < 10: similar, > 20: different.
@@ -532,6 +587,12 @@ class ColorMatcherApp:
         self._eye_mode = tk.BooleanVar(value=False)
         self._threshold = tk.DoubleVar(value=1.0)  # Delta E threshold (lower = stricter)
         self._max_retries = tk.IntVar(value=30)
+        self._use_lut = tk.BooleanVar(value=True)  # use 3D LUT for initial input (see lut_lookup.py)
+
+        # 3D LUT (optional — loaded at init, None if lut_3d.json missing)
+        self._lut = None
+        self._lut_path = _resource_path("lut_3d.json")
+        self._load_lut()
 
         self._load_calibration()
         self._build_ui()
@@ -543,6 +604,22 @@ class ColorMatcherApp:
 
     def _save_calibration(self):
         pass  # no file persistence — calibrate each session
+
+    def _load_lut(self):
+        """Load the 3D LUT from lut_3d.json if available.
+        Silent failure — self._lut stays None and the auto-adjust falls back
+        to the legacy iterative path.
+        """
+        if self._lut_path is None:
+            logging.info("LUT未検出: lut_3d.json not found — fallback to iterative-only")
+            return
+        try:
+            import lut_lookup  # lazy to avoid circular import at module scope
+            self._lut = lut_lookup.load_lut(self._lut_path)
+            logging.info(f"LUT読込完了: {len(self._lut)} points from {self._lut_path}")
+        except Exception as e:
+            logging.info(f"LUT読込失敗: {e} — fallback to iterative-only")
+            self._lut = None
 
     def _toggle_topmost(self):
         self._topmost = not self._topmost
@@ -878,6 +955,15 @@ class ColorMatcherApp:
             font=("Segoe UI", 8)
         ).pack(side="left", padx=(6, 0))
 
+        tk.Checkbutton(
+            settings, text="LUT", variable=self._use_lut,
+            bg=CARD_BG, fg=TEXT_PRIMARY, selectcolor=CARD_BORDER,
+            activebackground=CARD_BG, activeforeground=TEXT_PRIMARY,
+            font=("Segoe UI", 8),
+            state="normal" if self._lut is not None else "disabled",
+            disabledforeground=TEXT_DIM,
+        ).pack(side="left", padx=(6, 0))
+
         tk.Spinbox(settings, from_=1, to=20, increment=1, width=3,
                    textvariable=self._max_retries, font=("Segoe UI", 8),
                    bg=CARD_BORDER, fg=TEXT_PRIMARY, buttonbackground=CARD_BORDER
@@ -1188,36 +1274,170 @@ class ColorMatcherApp:
                 click_at(sx, sy, delay=0.1)
                 time.sleep(0.3)
 
-            # === Phase 2: HEX input (clamped, as initial guess) ===
-            if has_hex:
-                # Debug: sample before input
-                before = self._sample_game_color(use_eye=True) if self._watch_img_pos else None
-                hex_code = self._rgb_to_hex(tr, tg, tb)
-                _status(f"[2] HEX入力: #{hex_code}")
-                type_hex_into_field(hex_pos[0], hex_pos[1], hex_code)
-                time.sleep(0.8)  # wait for game to render
-                # Debug: sample after input
-                after = self._sample_game_color(use_eye=True) if self._watch_img_pos else None
-                logging.info(f"  HEX入力テスト: #{hex_code}")
-                logging.info(f"    入力前: {before}")
-                logging.info(f"    入力後: {after}")
-                if before and after and before == after:
-                    logging.info(f"    ⚠ 色が変わっていない！HEX入力が効いていない可能性")
+            # === Phase 2: Initial HEX input (LUT path or legacy clamp-send) ===
+            use_lut = self._use_lut.get() and self._lut is not None and has_hex
+
+            # Default initial state (overwritten by whichever path runs below)
+            cr, cg, cb = self._clamp_rgb(tr, tg, tb)
+            input_r, input_g, input_b = float(cr), float(cg), float(cb)
+            last_hex_sent = ""
+
+            # LUT-path tracking (None/empty if legacy path taken)
+            lut_predicted_de = None
+            lut_refinements = []  # list of (tag, hex_sent, measured, de)
+            lut_best_de = 999.0
+            lut_best_hex = ""
+            lut_best_result = None
+            lut_converged = False  # True if B1/B2 already hit threshold
+
+            if use_lut:
+                # --- A1: LUT trilinear inverse lookup ---
+                # NOTE: find_best_input takes ~300-600ms and is not cancellable
+                # (single non-responsive window per refinement round).
+                _status("LUT探索中...")
+                try:
+                    import lut_lookup  # lazy import to avoid circular dep at module scope
+                    best_in, pred_out, pred_de = lut_lookup.find_best_input(
+                        self.target_color, self._lut
+                    )
+                except Exception as e:
+                    logging.info(f"LUT探索失敗: {e}")
+                    best_in = None
+                    pred_out = None
+                    pred_de = None
+
+                if best_in is None:
+                    logging.info("LUT探索結果なし → fallback to clamp initial")
+                    use_lut = False
+                else:
+                    lut_predicted_de = pred_de
+                    cr, cg, cb = best_in
+                    hex_code = self._rgb_to_hex(cr, cg, cb)
+                    input_r, input_g, input_b = float(cr), float(cg), float(cb)
+                    last_hex_sent = hex_code
+
+                    if pred_de >= 15:
+                        _status(f"到達困難色 予測ΔE={pred_de:.1f} #{hex_code}", "#eab308")
+                    else:
+                        _status(f"[A1] LUT入力 #{hex_code} 予測ΔE={pred_de:.1f}")
+
+                    logging.info(
+                        f"LUT A1: best_in={best_in} pred_out={pred_out} 予測ΔE={pred_de:.2f}"
+                    )
+
+                    type_hex_into_field(hex_pos[0], hex_pos[1], hex_code)
+                    time.sleep(0.8)
+
+                    # --- B1/B2: Lab-residual refinement (max 2 rounds) ---
+                    if self._watch_img_pos:
+                        target_lab = rgb_to_lab(*self.target_color)
+                        effective_target_lab = target_lab
+                        for b_round in (1, 2):
+                            if self._cancel_adjust:
+                                break
+                            _status(f"[B{b_round}] 実測中...")
+                            measured = self._sample_game_color(use_eye=True)
+                            if measured is None:
+                                logging.info(f"LUT B{b_round}: キャプチャ失敗")
+                                break
+                            de_now = delta_e(self.target_color, measured)
+                            lut_refinements.append(
+                                (f"B{b_round}", last_hex_sent, measured, de_now)
+                            )
+                            logging.info(
+                                f"LUT B{b_round}: sent=#{last_hex_sent} "
+                                f"measured={measured} ΔE={de_now:.2f}"
+                            )
+
+                            if de_now < lut_best_de:
+                                lut_best_de = de_now
+                                lut_best_hex = last_hex_sent
+                                lut_best_result = measured
+
+                            if de_now <= threshold:
+                                _status(
+                                    f"[B{b_round}] 完了 ΔE={de_now:.2f} "
+                                    f"({delta_e_category(de_now)})",
+                                    GREEN,
+                                )
+                                lut_converged = True
+                                break
+
+                            # Safety: runaway measurement → bail to iterative loop
+                            if de_now > 30:
+                                logging.info(
+                                    f"LUT B{b_round}: 実測ΔE>30 — 反復ループにハンドオフ"
+                                )
+                                break
+
+                            # Compute Lab residual, adjust virtual target, re-search
+                            measured_lab = rgb_to_lab(*measured)
+                            effective_target_lab = (
+                                2 * effective_target_lab[0] - measured_lab[0],
+                                2 * effective_target_lab[1] - measured_lab[1],
+                                2 * effective_target_lab[2] - measured_lab[2],
+                            )
+                            eff_rgb = lab_to_rgb_approx(effective_target_lab)
+                            _status(f"[B{b_round}] 残差補正探索...")
+                            try:
+                                new_best_in, _, _ = lut_lookup.find_best_input(
+                                    eff_rgb, self._lut
+                                )
+                            except Exception as e:
+                                logging.info(f"LUT B{b_round} 探索失敗: {e}")
+                                break
+                            if new_best_in is None:
+                                break
+                            if new_best_in == (int(cr), int(cg), int(cb)):
+                                logging.info(
+                                    f"LUT B{b_round}: 同一入力 — 反復ループにハンドオフ"
+                                )
+                                break
+                            cr, cg, cb = new_best_in
+                            hex_code = self._rgb_to_hex(cr, cg, cb)
+                            input_r, input_g, input_b = float(cr), float(cg), float(cb)
+                            last_hex_sent = hex_code
+                            type_hex_into_field(hex_pos[0], hex_pos[1], hex_code)
+                            time.sleep(0.8)
+
+            if not use_lut:
+                # --- Legacy path: send clamped target HEX as initial guess ---
+                if has_hex:
+                    before = self._sample_game_color(use_eye=True) if self._watch_img_pos else None
+                    hex_code = self._rgb_to_hex(tr, tg, tb)
+                    _status(f"[2] HEX入力: #{hex_code}")
+                    type_hex_into_field(hex_pos[0], hex_pos[1], hex_code)
+                    time.sleep(0.8)
+                    after = self._sample_game_color(use_eye=True) if self._watch_img_pos else None
+                    logging.info(f"  HEX入力テスト: #{hex_code}")
+                    logging.info(f"    入力前: {before}")
+                    logging.info(f"    入力後: {after}")
+                    if before and after and before == after:
+                        logging.info(f"    ⚠ 色が変わっていない！HEX入力が効いていない可能性")
+                    last_hex_sent = hex_code
+
+                cr, cg, cb = self._clamp_rgb(tr, tg, tb)
+                input_r, input_g, input_b = float(cr), float(cg), float(cb)
 
             # === Phase 3: Verify + correct loop ===
             # Always correct towards the ORIGINAL target.
             # _rgb_to_hex handles clamping at output time only.
             # The game's gamma/color transform means input!=output, so we let
             # the correction loop discover the right input values empirically.
-            cr, cg, cb = self._clamp_rgb(tr, tg, tb)
-            input_r, input_g, input_b = float(cr), float(cg), float(cb)
-            last_hex_sent = self._rgb_to_hex(tr, tg, tb) if has_hex else ""
 
             if self._watch_img_pos:
-                best_de = 999.0
-                best_score = 0.0
-                best_result = None
-                best_hex = ""
+                # Inherit best from LUT B1/B2 if they ran; otherwise fresh
+                if use_lut and lut_refinements:
+                    best_de = lut_best_de
+                    best_score = (similarity_score(self.target_color, lut_best_result)
+                                  if lut_best_result else 0.0)
+                    best_result = lut_best_result
+                    best_hex = lut_best_hex
+                else:
+                    best_de = 999.0
+                    best_score = 0.0
+                    best_result = None
+                    best_hex = ""
                 prev_result = None
                 stall_count = 0
                 same_hex_count = 0
@@ -1243,11 +1463,22 @@ class ColorMatcherApp:
                 logging.info(f"  初期HEX(クランプ済): #{cr:02X}{cg:02X}{cb:02X}")
                 logging.info(f"  判定: Delta E (CIE76) 知覚距離")
                 logging.info(f"  設定: ΔE閾値={threshold} 最大={max_retries}回")
+                if lut_predicted_de is not None:
+                    logging.info(
+                        f"  LUT: 予測ΔE={lut_predicted_de:.2f}  "
+                        f"refinements={len(lut_refinements)}"
+                    )
+                    for tag, h, m, de_r in lut_refinements:
+                        logging.info(f"    {tag}: #{h} → {m} ΔE={de_r:.2f}")
+                if lut_converged:
+                    logging.info(f"  LUT で閾値到達 → 反復ループスキップ (best ΔE={best_de:.2f})")
                 logging.info(f"{'='*80}")
                 logging.info(f"{'回':>3} | {'送信HEX':>8} | {'実測RGB':>15} | {'誤差':>15} | {'input':>20} | {'damp':>5} | {'RGB%':>5} | {'ΔE':>5} | {'best':>5} | {'状態'}")
                 logging.info(f"{'-'*3}-+-{'-'*8}-+-{'-'*15}-+-{'-'*15}-+-{'-'*20}-+-{'-'*5}-+-{'-'*5}-+-{'-'*5}-+-{'-'*5}-+-{'-'*10}")
 
-                for attempt in range(max_retries):
+                # Skip iterative loop if LUT already converged
+                effective_max_retries = 0 if lut_converged else max_retries
+                for attempt in range(effective_max_retries):
                     if self._cancel_adjust:
                         logging.info("ユーザーによるキャンセル")
                         _status("キャンセル", TEXT_DIM)
